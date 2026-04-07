@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse, OutgoingHttpHeaders } from 'node:http'
-import { Http2ServerRequest } from 'node:http2'
+import { Http2ServerRequest, constants as h2constants } from 'node:http2'
 import type { Http2ServerResponse } from 'node:http2'
 import type { Writable } from 'node:stream'
 import type { IncomingMessageWithWrapBodyStream } from './request'
@@ -23,8 +23,67 @@ import { X_ALREADY_SENT } from './utils/response/constants'
 import './globals'
 
 const outgoingEnded = Symbol('outgoingEnded')
+const incomingDraining = Symbol('incomingDraining')
 type OutgoingHasOutgoingEnded = Http2ServerResponse & {
   [outgoingEnded]?: () => void
+}
+type IncomingHasDrainState = (IncomingMessage | Http2ServerRequest) & {
+  [incomingDraining]?: boolean
+}
+
+const DRAIN_TIMEOUT_MS = 500
+const MAX_DRAIN_BYTES = 64 * 1024 * 1024
+
+const drainIncoming = (incoming: IncomingMessage | Http2ServerRequest): void => {
+  const incomingWithDrainState = incoming as IncomingHasDrainState
+  if (incoming.destroyed || incomingWithDrainState[incomingDraining]) {
+    return
+  }
+  incomingWithDrainState[incomingDraining] = true
+
+  // HTTP/2: streams are multiplexed, so we can close immediately
+  // without risking TCP RST racing the response.
+  if (incoming instanceof Http2ServerRequest) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ;(incoming as any).stream?.close?.(h2constants.NGHTTP2_NO_ERROR)
+    } catch {
+      // stream may already be closed
+    }
+    return
+  }
+
+  let bytesRead = 0
+  const cleanup = () => {
+    clearTimeout(timer)
+    incoming.off('data', onData)
+    incoming.off('end', cleanup)
+    incoming.off('error', cleanup)
+  }
+
+  const forceClose = () => {
+    cleanup()
+    const socket = incoming.socket
+    if (socket && !socket.destroyed) {
+      socket.destroySoon()
+    }
+  }
+
+  const timer = setTimeout(forceClose, DRAIN_TIMEOUT_MS)
+  timer.unref?.()
+
+  const onData = (chunk: Buffer) => {
+    bytesRead += chunk.length
+    if (bytesRead > MAX_DRAIN_BYTES) {
+      forceClose()
+    }
+  }
+
+  incoming.on('data', onData)
+  incoming.on('end', cleanup)
+  incoming.on('error', cleanup)
+
+  incoming.resume()
 }
 
 const handleRequestError = (): Response =>
@@ -70,17 +129,35 @@ const responseViaCache = async (
 ): Promise<undefined | void> => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let [status, body, header] = (res as any)[cacheKey] as InternalCache
-  if (header instanceof Headers) {
+
+  let hasContentLength = false
+  if (!header) {
+    header = { 'content-type': 'text/plain; charset=UTF-8' }
+  } else if (header instanceof Headers) {
+    hasContentLength = header.has('content-length')
     header = buildOutgoingHttpHeaders(header)
+  } else if (Array.isArray(header)) {
+    const headerObj = new Headers(header)
+    hasContentLength = headerObj.has('content-length')
+    header = buildOutgoingHttpHeaders(headerObj)
+  } else {
+    for (const key in header) {
+      if (key.length === 14 && key.toLowerCase() === 'content-length') {
+        hasContentLength = true
+        break
+      }
+    }
   }
 
   // in `responseViaCache`, if body is not stream, Transfer-Encoding is considered not chunked
-  if (typeof body === 'string') {
-    header['Content-Length'] = Buffer.byteLength(body)
-  } else if (body instanceof Uint8Array) {
-    header['Content-Length'] = body.byteLength
-  } else if (body instanceof Blob) {
-    header['Content-Length'] = body.size
+  if (!hasContentLength) {
+    if (typeof body === 'string') {
+      header['Content-Length'] = Buffer.byteLength(body)
+    } else if (body instanceof Uint8Array) {
+      header['Content-Length'] = body.byteLength
+    } else if (body instanceof Blob) {
+      header['Content-Length'] = body.size
+    }
   }
 
   outgoing.writeHead(status, header)
@@ -247,15 +324,21 @@ export const getRequestListener = (
                 // and end is called at this point. At that point, nothing is done.
                 if (!incomingEnded) {
                   setTimeout(() => {
-                    incoming.destroy()
-                    // a Http2ServerResponse instance will not terminate without also calling outgoing.destroy()
-                    outgoing.destroy()
+                    drainIncoming(incoming)
                   })
                 }
               })
             }
           }
         }
+
+        // Drain incoming as soon as the response is flushed to the OS,
+        // before the socket is closed, to prevent TCP RST racing the response.
+        outgoing.on('finish', () => {
+          if (!incomingEnded) {
+            drainIncoming(incoming)
+          }
+        })
       }
 
       // Detect if request was aborted.
@@ -276,7 +359,7 @@ export const getRequestListener = (
             // and end is called at this point. At that point, nothing is done.
             if (!incomingEnded) {
               setTimeout(() => {
-                incoming.destroy()
+                drainIncoming(incoming)
               })
             }
           })
